@@ -3,23 +3,15 @@
 // --- Dependências ---
 const express = require('express');
 const mongoose = require('mongoose');
-const admin = require('firebase-admin');
 const cors = require('cors');
 const cron = require('node-cron');
-const multer = require('multer'); // Para upload de arquivos
-const path = require('path');   // Para gerenciar caminhos de arquivos
+const multer = require('multer');
+const path = require('path');
 require('dotenv').config();
 
 // --- Configuração Inicial ---
 const app = express();
 const port = process.env.PORT || 3000;
-
-// Configuração do Firebase Admin
-const serviceAccount = require('./serviceAccountKey.json');
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
-const firebaseAuth = admin.auth();
 
 // --- Configuração do Multer para Upload ---
 const storage = multer.diskStorage({
@@ -39,11 +31,9 @@ const storage = multer.diskStorage({
     cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
   }
 });
-
 const upload = multer({ storage: storage });
 
 // --- Schemas e Models do Mongoose ---
-
 const UserSchema = new mongoose.Schema({
   uid: { type: String, required: true, unique: true, index: true },
   email: { type: String, required: true, unique: true },
@@ -149,6 +139,7 @@ const NotificationSchema = new mongoose.Schema({
 });
 const Notification = mongoose.model('Notification', NotificationSchema);
 
+
 // --- Middlewares, Helpers e Configurações Globais ---
 app.use(cors());
 app.use(express.json());
@@ -166,26 +157,15 @@ async function createNotification(userId, title, message, link = null) {
     }
 }
 
-// Middlewares de autenticação
+// NOVO Middleware de Autenticação Simplificado
 const authMiddleware = async (req, res, next) => {
-    const { authorization } = req.headers;
-    if (!authorization || !authorization.startsWith('Bearer ')) {
-      return res.status(401).send({ error: 'Token não fornecido ou mal formatado.' });
-    }
-    const token = authorization.split('Bearer ')[1];
-    try {
-      const decodedToken = await firebaseAuth.verifyIdToken(token);
-      req.user = await firebaseAuth.getUser(decodedToken.uid);
-      next();
-    } catch (error) {
-      return res.status(403).send({ error: 'Token inválido ou expirado.' });
-    }
-};
+    const uid = req.headers['x-user-uid'];
+    if (!uid) return res.status(401).send({ error: 'UID de usuário não fornecido.' });
+    
+    const userExists = await User.findOne({ uid: uid });
+    if (!userExists) return res.status(403).send({ error: 'Usuário não encontrado ou inválido.' });
 
-const emailVerifiedMiddleware = (req, res, next) => {
-    if (!req.user.emailVerified) {
-      return res.status(403).send({ error: 'Acesso bloqueado. Por favor, confirme seu e-mail.' });
-    }
+    req.user = { uid: uid, email: userExists.email }; // Anexa uid e email
     next();
 };
 
@@ -198,17 +178,18 @@ const adminMiddleware = async (req, res, next) => {
 };
 
 // --- ROTAS PÚBLICAS ---
-app.post('/api/register', async (req, res) => {
-    const { email, password, referralCode } = req.body;
-    if (!email || !password) return res.status(400).send({ error: 'E-mail e senha são obrigatórios.' });
+app.post('/api/create-db-user', async (req, res) => {
+    const { email, uid, referralCode } = req.body;
+    if (!email || !uid) return res.status(400).send({ error: 'E-mail e UID são obrigatórios.' });
 
     try {
-        const userRecord = await firebaseAuth.createUser({ email, password });
-        
+        if (await User.findOne({ uid: uid })) {
+            return res.status(409).send({ error: 'Usuário já existe no banco de dados.' });
+        }
+
         const newUser = new User({
-            uid: userRecord.uid,
-            email: userRecord.email,
-            referralLink: `${req.protocol}://${req.get('host')}/register?ref=${userRecord.uid}`,
+            uid, email,
+            referralLink: `${req.protocol}://${req.get('host')}/registro.html?ref=${uid}`,
             bonusBalanceUSDT: 1.0,
         });
 
@@ -219,20 +200,20 @@ app.post('/api/register', async (req, res) => {
 
         await newUser.save();
         
-        await new Transaction({
-            userId: userRecord.uid, type: 'signup_bonus', amount: 1.0, description: 'Bônus de boas-vindas'
-        }).save();
-        await createNotification(userRecord.uid, "Bem-vindo!", "Você ganhou 1 USDT de bônus para começar!");
+        await Transaction.create({
+            userId: uid, type: 'signup_bonus', amount: 1.0, description: 'Bônus de boas-vindas'
+        });
+        await createNotification(uid, "Bem-vindo!", "Você ganhou 1 USDT de bônus para começar!");
 
-        res.status(201).send({ uid: userRecord.uid, email: userRecord.email, message: 'Usuário criado. Verifique seu e-mail.' });
+        res.status(201).send({ message: 'Usuário criado no banco de dados com sucesso.' });
     } catch (error) {
-        res.status(400).send({ error: error.message });
+        res.status(500).send({ error: error.message });
     }
 });
 
 // --- ROTAS DO USUÁRIO ---
 const userRouter = express.Router();
-userRouter.use(authMiddleware, emailVerifiedMiddleware);
+userRouter.use(authMiddleware);
 
 userRouter.post('/deposit-request', upload.single('proofImage'), async (req, res) => {
     const { amount, paymentMethodId } = req.body;
@@ -270,9 +251,9 @@ userRouter.post('/withdrawal-request', async (req, res) => {
         });
         await withdrawal.save({ session });
         
-        await new Transaction({
+        await Transaction.create({
             userId: req.user.uid, type: 'withdrawal', amount: -parseFloat(amount), description: `Solicitação de saque para ${walletAddress}`, status: 'pending'
-        }).save({ session });
+        });
         
         await session.commitTransaction();
         
@@ -296,7 +277,6 @@ userRouter.post('/notifications/mark-read', async (req, res) => {
     res.status(200).send({ message: 'Notificações marcadas como lidas.' });
 });
 
-// ... (outras rotas do usuário como dashboard, buy-bot, etc., continuam válidas)
 app.use('/api/user', userRouter);
 
 
@@ -341,9 +321,9 @@ adminRouter.post('/approve-deposit/:id', async (req, res) => {
                 if (milestone > 0 && referrer.qualifiedReferrals % 100 === 0) {
                     const bonusAmount = (milestone / 100) * 15;
                     referrer.balanceUSDT += bonusAmount;
-                    await new Transaction({
+                    await Transaction.create({
                         userId: referrer.uid, type: 'referral_milestone_bonus', amount: bonusAmount, description: `Bônus por atingir ${milestone} indicações.`
-                    }).save({ session });
+                    });
                     await createNotification(referrer.uid, "Meta Atingida!", `Parabéns! Você ganhou ${bonusAmount} USDT por ${milestone} indicações.`);
                 }
                 await referrer.save({ session });
@@ -353,9 +333,9 @@ adminRouter.post('/approve-deposit/:id', async (req, res) => {
         await user.save({ session });
         await deposit.save({ session });
 
-        await new Transaction({
+        await Transaction.create({
             userId: deposit.userId, type: 'deposit', amount: deposit.amount, description: 'Depósito aprovado'
-        }).save({ session });
+        });
 
         await session.commitTransaction();
         await createNotification(deposit.userId, "Depósito Aprovado!", `Seu depósito de ${deposit.amount} USDT foi creditado.`);
@@ -426,20 +406,18 @@ adminRouter.post('/reject-request/:type/:id', async (req, res) => {
     }
 });
 
-
-// ... (outras rotas de admin como create-bot-type, users, stats, banners continuam válidas)
 app.use('/api/admin', adminRouter);
 
 
-// --- CRON JOB: Pagamento Diário de Lucros ---
-cron.schedule('0 0 * * *', async () => {
-    // (Lógica do cron job inalterada)
+// --- CRON JOB e Inicialização do Servidor ---
+cron.schedule('0 0 * * *', async () => { 
+    console.log('--- Iniciando rotina de pagamento diário de lucros (Fuso: Africa/Maputo) ---');
+    // ... (Lógica do cron job - buscar bots ativos, pagar lucros, etc.)
 }, {
     scheduled: true,
     timezone: "Africa/Maputo"
 });
 
-// --- Inicialização do Servidor ---
 mongoose.connect(process.env.MONGO_URI, {
     useNewUrlParser: true,
     useUnifiedTopology: true,
