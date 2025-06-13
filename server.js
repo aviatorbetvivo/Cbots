@@ -279,6 +279,28 @@ userRouter.post('/notifications/mark-read', async (req, res) => {
 
 app.use('/api/user', userRouter);
 
+// Dentro do seu server.js, na seção de userRouter
+
+userRouter.get('/dashboard-data', async (req, res) => {
+    try {
+        const user = await User.findOne({ uid: req.user.uid }).select('-__v');
+        if (!user) {
+            return res.status(404).send({ error: 'Usuário não encontrado.' });
+        }
+        
+        const activeBots = await ActiveBot.find({ userId: req.user.uid, status: 'active' });
+
+        res.status(200).send({
+            user: user,
+            activeBots: activeBots
+        });
+
+    } catch (error) {
+        console.error("Erro ao buscar dados do dashboard:", error);
+        res.status(500).send({ error: "Erro interno do servidor." });
+    }
+});
+
 
 // --- ROTAS DO ADMINISTRADOR ---
 const adminRouter = express.Router();
