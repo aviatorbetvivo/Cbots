@@ -6,8 +6,6 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { initializeApp } = require('firebase/app');
-const { getAuth, sendPasswordResetEmail } = require('firebase/auth');
 const cron = require('node-cron');
 const multer = require('multer');
 const path = require('path');
@@ -21,9 +19,13 @@ const port = process.env.PORT || 3000;
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
     let uploadPath = '';
-    if (req.originalUrl.includes('/api/user/deposit-request')) uploadPath = 'uploads/deposits/';
-    else if (req.originalUrl.includes('/api/admin/approve-withdrawal')) uploadPath = 'uploads/withdrawals/';
-    else return cb(new Error("Rota de upload inválida"), null);
+    if (req.originalUrl.includes('/api/user/deposit-request')) {
+      uploadPath = 'uploads/deposits/';
+    } else if (req.originalUrl.includes('/api/admin/approve-withdrawal')) {
+      uploadPath = 'uploads/withdrawals/';
+    } else {
+      return cb(new Error("Rota de upload inválida"), null);
+    }
     cb(null, uploadPath);
   },
   filename: function (req, file, cb) {
@@ -110,6 +112,7 @@ const DepositRequest = mongoose.model('DepositRequest', DepositRequestSchema);
 
 const WithdrawalRequestSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    transactionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Transaction', required: true },
     userEmail: { type: String, required: true },
     amount: { type: Number, required: true },
     walletAddress: { type: String, required: true },
@@ -131,7 +134,7 @@ const NotificationSchema = new mongoose.Schema({
 });
 const Notification = mongoose.model('Notification', NotificationSchema);
 
-// --- Middlewares, Helpers e Configurações Globais ---
+// --- Middlewares e Helpers ---
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -192,24 +195,6 @@ authRouter.post('/login', async (req, res) => {
         res.status(200).send({ token, userId: user._id });
     } catch (error) {
         res.status(500).send({ error: "Erro interno do servidor." });
-    }
-});
-
-const firebaseConfig = { /* COLE SEU FIREBASE CONFIG DO CLIENTE AQUI */ };
-initializeApp(firebaseConfig);
-const firebaseAuthClient = getAuth();
-
-authRouter.post('/forgot-password', async (req, res) => {
-    const { email } = req.body;
-    try {
-        if (!(await User.findOne({ email }))) {
-            return res.status(200).send({ message: "Se um usuário com este e-mail existir, um link de recuperação foi enviado." });
-        }
-        await sendPasswordResetEmail(firebaseAuthClient, email);
-        res.status(200).send({ message: "Se um usuário com este e-mail existir, um link de recuperação foi enviado." });
-    } catch (error) {
-        console.error("Erro na recuperação de senha:", error.code);
-        res.status(500).send({ error: "Erro ao processar a solicitação." });
     }
 });
 app.use('/api/auth', authRouter);
@@ -277,12 +262,14 @@ userRouter.post('/withdrawal-request', async (req, res) => {
         if (!user || user.balanceUSDT < parseFloat(amount)) throw new Error("Saldo insuficiente.");
 
         user.balanceUSDT -= parseFloat(amount);
+        
+        const newTransaction = new Transaction({ userId: user._id, type: 'withdrawal', amount: -parseFloat(amount), description: `Solicitação de saque para ${walletAddress}`, status: 'pending' });
+        
+        const withdrawal = new WithdrawalRequest({ userId: user._id, transactionId: newTransaction._id, userEmail: user.email, amount: parseFloat(amount), walletAddress });
+
         await user.save({ session });
-        
-        const withdrawal = new WithdrawalRequest({ userId: user._id, userEmail: user.email, amount: parseFloat(amount), walletAddress });
+        await newTransaction.save({ session });
         await withdrawal.save({ session });
-        
-        await Transaction.create([{ userId: user._id, type: 'withdrawal', amount: -parseFloat(amount), description: `Solicitação de saque para ${walletAddress}`, status: 'pending' }], { session });
         
         await session.commitTransaction();
         await createNotification(user._id, "Saque em Processamento", `Sua solicitação de saque de ${amount} USDT foi registrada.`);
@@ -372,14 +359,14 @@ adminRouter.post('/approve-withdrawal/:id', upload.single('adminProofImage'), as
     if (!req.file) return res.status(400).send({ error: "O comprovante é obrigatório." });
 
     const withdrawal = await WithdrawalRequest.findById(id);
-    if (!withdrawal || withdrawal.status !== 'pending') throw new Error("Solicitação não encontrada ou já processada.");
+    if (!withdrawal || withdrawal.status !== 'pending') throw new Error("Solicitação de saque não encontrada ou já processada.");
 
     withdrawal.status = 'approved';
     withdrawal.processedAt = new Date();
     withdrawal.adminProofImageUrl = req.file.path;
     await withdrawal.save();
 
-    await Transaction.updateOne({ _id: withdrawal.transactionId, status: 'pending' }, { $set: { status: 'completed' } });
+    await Transaction.findByIdAndUpdate(withdrawal.transactionId, { $set: { status: 'completed' } });
     await createNotification(withdrawal.userId, "Saque Aprovado", `Seu saque de ${withdrawal.amount} USDT foi enviado.`);
     res.status(200).send({ message: "Saque aprovado." });
 });
@@ -402,7 +389,7 @@ adminRouter.post('/reject-request/:type/:id', async (req, res) => {
         
         if (type === 'withdrawal') {
             await User.findByIdAndUpdate(request.userId, { $inc: { balanceUSDT: request.amount } }, { session });
-            await Transaction.updateOne({ _id: request.transactionId, status: 'pending' }, { $set: { status: 'rejected', description: `Saque rejeitado: ${reason}` } });
+            await Transaction.findByIdAndUpdate(request.transactionId, { $set: { status: 'rejected', description: `Saque rejeitado: ${reason}` } });
         }
 
         await request.save({ session });
@@ -416,14 +403,20 @@ adminRouter.post('/reject-request/:type/:id', async (req, res) => {
         session.endSession();
     }
 });
+
+adminRouter.get('/users', async (req, res) => {
+    const users = await User.find({}).select('-password');
+    res.status(200).send(users);
+});
 app.use('/api/admin', adminRouter);
 
-// --- CRON JOB e Inicialização do Servidor ---
+// --- CRON JOB ---
 cron.schedule('0 0 * * *', async () => { 
     console.log('--- Iniciando rotina de pagamento diário de lucros (Fuso: Africa/Maputo) ---');
     // Adicione a lógica do cron job aqui
 }, { scheduled: true, timezone: "Africa/Maputo" });
 
+// --- Inicialização do Servidor ---
 mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
 .then(() => {
     console.log("Conectado ao MongoDB Atlas com sucesso!");
