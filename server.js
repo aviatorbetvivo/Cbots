@@ -130,7 +130,7 @@ app.post('/api/auth/register', async (req, res) => {
         user = new User({ name, email, password: hashedPassword, verificationToken });
         await user.save();
 
-        const verificationUrl = `http://localhost:${PORT}/email-verification.html?token=${verificationToken}`;
+        const verificationUrl = `https://cbots.onrender.com/email-verification.html?token=${verificationToken}`;
         await transporter.sendMail({
             from: `"Sua Plataforma" <${process.env.EMAIL_USER}>`,
             to: email,
